@@ -1,0 +1,25 @@
+[Unit]
+Description=VLESS+REALITY Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/vless-server
+ExecStart=/usr/local/bin/vless-server -config /etc/vless-server/.env
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+# Security
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

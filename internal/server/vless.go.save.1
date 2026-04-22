@@ -1,0 +1,232 @@
+package server
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "os"
+    "os/signal"
+    "path/filepath"
+    "strings"
+    "syscall"
+
+    "github.com/xtls/xray-core/core"
+    "github.com/xtls/xray-core/infra/conf/serial"
+    
+    "go-vless-server/internal/config"
+    "go-vless-server/internal/logger"
+)
+
+type VLESServer struct {
+    config *config.Config
+    logger *logger.FilteredLogger
+    server core.Server
+    cancel context.CancelFunc
+}
+
+func NewVLESServer(cfg *config.Config, logger *logger.FilteredLogger) *VLESServer {
+    return &VLESServer{
+        config: cfg,
+        logger: logger,
+    }
+}
+
+func (s *VLESServer) generateXrayConfig() ([]byte, error) {
+    // Формируем список клиентов
+    clients := make([]map[string]interface{}, 0)
+    for _, client := range s.config.ClientsManager.GetAllClients() {
+        if client.Enabled {
+            clients = append(clients, map[string]interface{}{
+                "id":   client.UUID,
+                "flow": "xtls-rprx-vision",
+            })
+        }
+    }
+
+    if len(clients) == 0 {
+        return nil, fmt.Errorf("no active clients found")
+    }
+
+    // Создаем конфигурацию в формате JSON
+    configMap := map[string]interface{}{
+        "log": map[string]interface{}{
+            "loglevel": "debug",      // Максимальная детализация
+            "access":   "console",    // Логи подключений в консоль
+            "error":    "console",    // Логи ошибок в консоль
+        },
+        "inbounds": []map[string]interface{}{
+            {
+                "listen":    "0.0.0.0",
+                "port":      s.config.Port,
+                "protocol":  "vless",
+                "settings": map[string]interface{}{
+                    "clients":    clients,
+                    "decryption": "none",
+                },
+                "streamSettings": map[string]interface{}{
+                    "network":  "tcp",
+                    "security": "reality",
+                    "realitySettings": map[string]interface{}{
+        "dest":        s.config.RealityDest,
+        "serverNames": s.config.RealityServerNames,
+        "privateKey":  s.config.RealityPrivateKey,
+        "shortIds":    s.config.RealityShortIds,
+    },
+    "sniffing": map[string]interface{}{
+        "enabled": true,
+        "destOverride": []string{"http", "tls"},
+    },
+    // ДОБАВИТЬ ЭТО:
+    "sockopt": map[string]interface{}{
+        "tcpKeepAliveIdle":     30,  // Ждать 30 сек перед keep-alive (было 300)
+        "tcpKeepAliveInterval": 15,  // Интервал между keep-alive 15 сек
+        "tcpNoDelay":           true, // Отключаем Nagle — меньше задержка
+    },
+},
+                "sniffing": map[string]interface{}{
+                    "enabled": true,
+                    "destOverride": []string{"http", "tls"},
+                },
+            },
+        },
+        "outbounds": []map[string]interface{}{
+            {
+                "protocol": "freedom",
+                "tag":      "direct",
+            },
+            {
+                "protocol": "dns",
+                "tag":      "dns-out",
+            },
+        },
+        "dns": map[string]interface{}{
+            "servers": s.config.DNSServers,
+        },
+    }
+
+    // Преобразуем в JSON
+    configJSON, err := json.MarshalIndent(configMap, "", "  ")
+    if err != nil {
+        return nil, fmt.Errorf("failed to marshal config: %w", err)
+    }
+
+    // Сохраняем конфиг для отладки (опционально)
+    configPath := filepath.Join(os.TempDir(), "vless_config.json")
+    if err := os.WriteFile(configPath, configJSON, 0644); err != nil {
+        s.logger.Warnf("Failed to write config to file: %v", err)
+    } else {
+        s.logger.Infof("Config saved to %s", configPath)
+    }
+
+    return configJSON, nil
+}
+
+func (s *VLESServer) Start(ctx context.Context) error {
+    s.logger.Info("Generating Xray configuration...")
+
+    // Генерируем конфигурацию
+    configJSON, err := s.generateXrayConfig()
+    if err != nil {
+        return fmt.Errorf("failed to generate config: %w", err)
+    }
+
+    // Загружаем конфигурацию Xray-core (преобразуем []byte в io.Reader)
+    config, err := serial.LoadJSONConfig(strings.NewReader(string(configJSON)))
+    if err != nil {
+        return fmt.Errorf("failed to load Xray config: %w", err)
+    }
+
+    // Создаем экземпляр Xray-core
+    server, err := core.New(config)
+    if err != nil {
+        return fmt.Errorf("failed to create Xray instance: %w", err)
+    }
+    s.server = server
+
+    // Запускаем сервер
+    if err := server.Start(); err != nil {
+        return fmt.Errorf("failed to start Xray: %w", err)
+    }
+
+    s.logger.Infof("VLESS+REALITY server started on port %d", s.config.Port)
+    s.logger.Infof("Active clients: %d", len(s.config.ClientsManager.GetAllClients()))
+    s.logger.Info("Xray is running as embedded library")
+
+    // Создаем контекст с отменой для graceful shutdown
+    ctx, cancel := context.WithCancel(ctx)
+    s.cancel = cancel
+
+    // Обрабатываем сигналы ОС
+    go s.handleSignals()
+
+    // Ждем сигнала завершения
+    <-ctx.Done()
+
+    return s.Stop()
+}
+
+func (s *VLESServer) handleSignals() {
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+    
+    sig := <-sigCh
+    s.logger.Infof("Received signal: %v", sig)
+    if s.cancel != nil {
+        s.cancel()
+    }
+}
+
+func (s *VLESServer) Stop() error {
+    s.logger.Info("Shutting down VLESS server...")
+    
+    if s.server != nil {
+        // Закрываем сервер
+        if err := s.server.Close(); err != nil {
+            s.logger.Errorf("Error closing Xray server: %v", err)
+        }
+        s.logger.Info("Xray instance closed successfully")
+    }
+    
+    s.logger.Info("VLESS server stopped successfully")
+    return nil
+}
+
+// Добавляем метод для динамического обновления конфигурации (без Reload)
+// Поскольку Reload недоступен, мы будем пересоздавать сервер
+func (s *VLESServer) Reload() error {
+    s.logger.Info("Reloading Xray configuration...")
+    
+    // Останавливаем текущий сервер
+    if s.server != nil {
+        if err := s.server.Close(); err != nil {
+            s.logger.Errorf("Error closing old server: %v", err)
+        }
+    }
+    
+    // Генерируем новую конфигурацию
+    configJSON, err := s.generateXrayConfig()
+    if err != nil {
+        return fmt.Errorf("failed to generate new config: %w", err)
+    }
+    
+    // Загружаем новую конфигурацию
+    config, err := serial.LoadJSONConfig(strings.NewReader(string(configJSON)))
+    if err != nil {
+        return fmt.Errorf("failed to load new config: %w", err)
+    }
+    
+    // Создаем новый экземпляр
+    server, err := core.New(config)
+    if err != nil {
+        return fmt.Errorf("failed to create new Xray instance: %w", err)
+    }
+    
+    // Запускаем новый сервер
+    if err := server.Start(); err != nil {
+        return fmt.Errorf("failed to start new Xray instance: %w", err)
+    }
+    
+    s.server = server
+    s.logger.Info("Configuration reloaded successfully")
+    return nil
+}
