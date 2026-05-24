@@ -1,0 +1,71 @@
+# =============================================================================
+# VLESS+REALITY Server  Docker Compose
+# =============================================================================
+#
+# Prerequisites (run once after cloning the repo):
+#   1. Initialize the Go module:
+#        go mod init go-vless-server && go mod tidy
+#      (This generates go.mod and go.sum needed by the Docker build.)
+#
+#   2. Create real config files from the provided examples:
+#        cp configs/env.properties.example configs/env.properties
+#        cp data/clients.json.example data/clients.json
+#      Then edit configs/env.properties to set your REALITY keys, ports, etc.
+#
+# Usage:
+#   docker compose up -d          # Build & start in background
+#   docker compose logs -f        # Follow logs
+#   docker compose down           # Stop & remove container
+# =============================================================================
+
+services:
+  vless-server:
+    container_name: vless-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    # ---------- Ports ----------
+    # The server exposes two listeners by default:
+    #   8443/tcp  VLESS+REALITY over TCP  (SERVER_PORT)
+    #   8445/tcp  VLESS+REALITY over XHTTP (SERVER_PORT + 2)
+    #
+    # Change the left-hand (host) numbers as needed, or uncomment 443 to
+    # run on the standard HTTPS port (requires changing SERVER_PORT in .env).
+    ports:
+      - "8443:8443/tcp"
+      - "8445:8445/tcp"
+      # - "443:443/tcp"
+      # - "443:443/udp"
+
+    # ---------- Volumes ----------
+    # Mount your REAL config files (NOT the .example templates).
+    volumes:
+      # Config  mounted at the default config path expected by the server
+      - ./configs/env.properties:/app/data/.env:ro
+      # Persist client database so it survives container restarts
+      - ./data/clients.json:/app/data/clients.json
+
+    # ---------- Resource limits (optional) ----------
+    # Uncomment and adjust as needed:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "1"
+    #       memory: "256M"
+
+    # ---------- Health check (optional) ----------
+    # healthcheck:
+    #   test: ["CMD", "nc", "-z", "localhost", "8443"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 10s
+
+    # ---------- Logging ----------
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
